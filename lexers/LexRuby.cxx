@@ -271,6 +271,10 @@ bool followsDot(Sci_PositionU pos, Accessor &styler) {
     return false;
 }
 
+constexpr bool IsIdentifierStyle(int style) noexcept {
+    return style == SCE_RB_IDENTIFIER || style >= SubStylesFirst;
+}
+
 // Forward declarations
 bool keywordIsAmbiguous(const std::string &prevWord) noexcept;
 bool keywordDoStartsLoop(Sci_Position pos, Accessor &styler);
@@ -279,13 +283,9 @@ bool keywordIsModifier(const std::string &word, Sci_Position pos, Accessor &styl
 // pseudo style: prefer regex after identifier
 #define SCE_RB_IDENTIFIER_PREFERRE  SCE_RB_UPPER_BOUND
 
-int ClassifyWordRb(Sci_PositionU start, Sci_PositionU end, char ch, const WordList &keywords, Accessor &styler, std::string &prevWord, const WordClassifier &idClasser) {
-    std::string s;
-    Sci_PositionU j = 0;
-    const Sci_PositionU lim = end - start + 1; // num chars to copy
-    for (Sci_PositionU i = start; j < lim; i++, j++) {
-        s.push_back(styler[i]);
-    }
+int ClassifyWordRb(Sci_PositionU end, char ch, char chNext, const WordList &keywords, Accessor &styler, std::string &prevWord, const WordClassifier &idClasser) {
+    const Sci_PositionU start = styler.GetStartSegment();
+    const std::string s = styler.GetRange(start, end);
     int chAttr = SCE_RB_IDENTIFIER;
     int style = SCE_RB_DEFAULT;
     if (prevWord == "class")
@@ -294,11 +294,15 @@ int ClassifyWordRb(Sci_PositionU start, Sci_PositionU end, char ch, const WordLi
         chAttr = SCE_RB_MODULE_NAME;
     else if (prevWord == "def") {
         chAttr = SCE_RB_DEFNAME;
-        if (ch == '.') {
+        if (ch == '.' || (ch == ':' && chNext == ':')) {
             if (s == "self") {
                 style = SCE_RB_WORD_DEMOTED;
             } else {
                 style = SCE_RB_IDENTIFIER;
+                const int subStyle = idClasser.ValueFor(s);
+                if (subStyle >= 0) {
+                    style = subStyle;
+                }
             }
         }
     } else if ((start == 0) || !followsDot(start - 1, styler)) {
@@ -324,7 +328,6 @@ int ClassifyWordRb(Sci_PositionU start, Sci_PositionU end, char ch, const WordLi
         } else {
             const int subStyle = idClasser.ValueFor(s);
             if (subStyle >= 0) {
-                chAttr = subStyle;
                 style = subStyle;
             }
         }
@@ -333,7 +336,7 @@ int ClassifyWordRb(Sci_PositionU start, Sci_PositionU end, char ch, const WordLi
         style = chAttr;
         prevWord.clear();
     }
-    styler.ColourTo(end, style);
+    styler.ColourTo(end - 1, style);
 
     if (chAttr == SCE_RB_IDENTIFIER) {
         // find heredoc in lib/ruby folder: rg "\w+\s+<<[\w\-~'\"`]"
@@ -422,11 +425,10 @@ bool currLineContainsHereDelims(Sci_Position &startPos, Accessor &styler) {
             // the EOL isn't default style
 
             return false;
-        } else {
-            styler.Flush();
-            if (styler.StyleIndexAt(pos) == SCE_RB_HERE_DELIM) {
-                break;
-            }
+        }
+        styler.Flush();
+        if (styler.StyleIndexAt(pos) == SCE_RB_HERE_DELIM) {
+            break;
         }
     }
     if (pos == 0) {
@@ -442,12 +444,10 @@ bool currLineContainsHereDelims(Sci_Position &startPos, Accessor &styler) {
 
 class QuoteCls {
 public:
-    int  Count;
-    char Up;
-    char Down;
-    QuoteCls() noexcept {
-        New();
-    }
+    int  Count = 0;
+    char Up = '\0';
+    char Down = '\0';
+    QuoteCls() noexcept = default;
     void New() noexcept {
         Count = 0;
         Up    = '\0';
@@ -630,15 +630,14 @@ Sci_Position findExpressionStart(Sci_Position pos, Sci_Position min_pos, Accesso
     for (; pos > min_pos; pos -= 1) {
         const int style = styler.StyleIndexAt(pos - 1);
         if (style == SCE_RB_OPERATOR) {
-            const int ch = styler[pos - 1];
+            const char ch = styler[pos - 1];
             if (ch == '}' || ch == ')' || ch == ']') {
                 depth += 1;
             } else if (ch == '{' || ch == '(' || ch == '[') {
                 if (depth == 0) {
                     break;
-                } else {
-                    depth -= 1;
                 }
+                depth -= 1;
             } else if (ch == ';' && depth == 0) {
                 break;
             }
@@ -680,7 +679,7 @@ bool sureThisIsNotHeredoc(Sci_Position lt2StartPos, Accessor &styler) {
     }
     int prevStyle = styler.StyleIndexAt(firstWordPosn);
     // If we have '<<' following a keyword, it's not a heredoc
-    if (prevStyle != SCE_RB_IDENTIFIER
+    if (!IsIdentifierStyle(prevStyle)
             && prevStyle != SCE_RB_GLOBAL       // $stdout and $stderr
             && prevStyle != SCE_RB_SYMBOL
             && prevStyle != SCE_RB_INSTANCE_VAR
@@ -795,15 +794,13 @@ bool sureThisIsNotHeredoc(Sci_Position lt2StartPos, Accessor &styler) {
             j = skipWhitespace(j, lengthDoc, styler);
             if (j >= lengthDoc) {
                 return definitely_not_a_here_doc;
-            } else {
-                const char ch = styler[j];
-                if (ch == '#' || isEOLChar(ch) || ch == '.' || ch == ',' || IsLowerCase(ch)) {
-                    // This is OK, so break and continue;
-                    break;
-                } else {
-                    return definitely_not_a_here_doc;
-                }
             }
+            const char ch = styler[j];
+            if (ch == '#' || isEOLChar(ch) || ch == '.' || ch == ',' || IsLowerCase(ch)) {
+                // This is OK, so break and continue;
+                break;
+            }
+            return definitely_not_a_here_doc;
         }
     }
 
@@ -973,10 +970,10 @@ void LexerRuby::Lex(Sci_PositionU startPos, Sci_Position length, int initStyle, 
     public:
         int brace_counts = 0;   // Number of #{ ... } things within an expression
 
-        bool canEnter() const noexcept {
+        [[nodiscard]] bool canEnter() const noexcept {
             return inner_string_count < INNER_STRINGS_MAX_COUNT;
         }
-        bool canExit() const noexcept {
+        [[nodiscard]] bool canExit() const noexcept {
             return inner_string_count > 0;
         }
         void enter(int &state, const QuoteCls &curr_quote) noexcept {
@@ -1021,8 +1018,7 @@ void LexerRuby::Lex(Sci_PositionU startPos, Sci_Position length, int initStyle, 
             // Begin of here-doc (the line after the here-doc delimiter):
             HereDoc.State = 2;
             if (state == SCE_RB_WORD) {
-                const Sci_Position wordStartPos = styler.GetStartSegment();
-                ClassifyWordRb(wordStartPos, i - 1, ch, keywords, styler, prevWord, idClasser);
+                ClassifyWordRb(i, ch, chNext, keywords, styler, prevWord, idClasser);
             } else {
                 styler.ColourTo(i - 1, state);
             }
@@ -1388,8 +1384,7 @@ void LexerRuby::Lex(Sci_PositionU startPos, Sci_Position length, int initStyle, 
                     // No need to handle this state -- we'll just move to the end
                     preferRE = false;
                 } else {
-                    const Sci_Position wordStartPos = styler.GetStartSegment();
-                    const int word_style = ClassifyWordRb(wordStartPos, i - 1, ch, keywords, styler, prevWord, idClasser);
+                    const int word_style = ClassifyWordRb(i, ch, chNext, keywords, styler, prevWord, idClasser);
                     switch (word_style) {
                     case SCE_RB_WORD:
                         afterDef = prevWord == "def";
@@ -1728,7 +1723,7 @@ void LexerRuby::Lex(Sci_PositionU startPos, Sci_Position length, int initStyle, 
     if (state == SCE_RB_WORD) {
         // We've ended on a word, possibly at EOF, and need to
         // classify it.
-        ClassifyWordRb(styler.GetStartSegment(), lengthDoc - 1, '\0', keywords, styler, prevWord, idClasser);
+        ClassifyWordRb(lengthDoc, '\0', '\0', keywords, styler, prevWord, idClasser);
     } else {
         styler.ColourTo(lengthDoc - 1, state);
     }
@@ -2084,7 +2079,7 @@ void LexerRuby::Fold(Sci_PositionU startPos, Sci_Position length, int initStyle,
             case MethodDefinition::Define:
                 if (style == SCE_RB_OPERATOR) {
                     method_definition = MethodDefinition::Operator;
-                } else if (style == SCE_RB_DEFNAME || style == SCE_RB_WORD_DEMOTED || style == SCE_RB_CLASSNAME || style == SCE_RB_IDENTIFIER) {
+                } else if (style == SCE_RB_DEFNAME || style == SCE_RB_WORD_DEMOTED || style == SCE_RB_CLASSNAME || IsIdentifierStyle(style)) {
                     method_definition = MethodDefinition::Name;
                 } else if (!(style == SCE_RB_WORD || IsASpaceOrTab(ch))) {
                     method_definition = MethodDefinition::None;
